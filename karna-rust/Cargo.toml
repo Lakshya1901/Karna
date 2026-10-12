@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "karna-storage",
+    "karna-server",
+    "karna-client",
+    "karna-consensus",
+]
+

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+# Rust build output
+karna-rust/target/
+# LaTeX build output
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.pdf
