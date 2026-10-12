@@ -89,6 +89,7 @@ Bugs found and fixed while validating the engine, because they're the interestin
 pip install -r requirements.txt
 pytest -q                               # 13 tests: reads across compactions, deletes, crash recovery, filters
 python3 karna/benchmarks/benchmark.py   # reproduces every number in this README
+python3 docs/make_chart.py              # redraws the comparison chart
 ```
 
 ```python
