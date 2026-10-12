@@ -11,3 +11,6 @@ paper/*.aux
 paper/*.log
 paper/*.out
 paper/*.pdf
+
+# Uncompiled Rust port skeleton, kept locally only
+karna-rust/
