@@ -1,63 +1,117 @@
 # Karna
 
-An LSM-tree key-value store in Python with a **learned Bloom filter**: a small neural classifier in front of a backup Bloom filter, after Kraska et al. (2018) and Mitzenmacher (2018).
+### A database storage engine built from scratch, with a machine-learning twist that makes its lookup filters up to **10× smaller**.
 
+[![tests](https://github.com/Lakshya1901/Karna/actions/workflows/tests.yml/badge.svg)](https://github.com/Lakshya1901/Karna/actions/workflows/tests.yml)
+
+Every big database (RocksDB, Cassandra, LevelDB, Google Bigtable) stores data using the same idea: the **LSM tree**. Karna is a from-scratch implementation of that architecture in Python (write-ahead log, memtable, SSTables, compaction, crash recovery) plus one original experiment: replacing the Bloom filters that speed up reads with a **learned Bloom filter**, a small neural network trained to recognise your data.
+
+<p align="center"><img src="docs/bloom_comparison.png" alt="Learned Bloom filter uses 10x less memory and half the false positives when absent keys look different from stored keys; when they look identical it correctly falls back and costs more"></p>
+
+> **The honest takeaway:** when the keys you *don't* have look different from the keys you *do* have, the learned filter is **10× smaller and twice as accurate**. When they look identical, it can't learn anything, falls back to a classic filter, and ends up 25% *bigger*. Both results are measured below, and the second is the one most write-ups leave out.
+
+---
+
+## How data flows through the engine
+
+```mermaid
+flowchart LR
+    W["put(key, value)"] --> WAL["Write-ahead log<br/>(crash safety)"]
+    WAL --> MT["MemTable<br/>sorted, in memory"]
+    MT -- "full" --> L0["Level 0 SSTables<br/>sorted files on disk"]
+    L0 -- "4 or more files<br/>merge, newest wins" --> L1["Level 1 SSTable<br/>one sorted file"]
 ```
-put(k, v) ─► WAL (append, crash recovery) ─► MemTable (sorted) ──flush──► L0 SSTable
-                                                                            │  ≥ 4 files
-                                                                            ▼
-get(k) ─► MemTable ─► L0 (newest first) ─► L1         merged, newest version wins ─► L1 SSTable
-                      └── per-SSTable Bloom filter skips tables that can't hold k
+
+```mermaid
+flowchart LR
+    R["get(key)"] --> M{"MemTable?"}
+    M -- "hit" --> F["return value"]
+    M -- "miss" --> B0{"L0 tables, newest first<br/>Bloom filter says maybe?"}
+    B0 -- "yes" --> D0["read that file"] --> F
+    B0 -- "no, skip the file" --> B1{"L1 tables"}
+    B1 --> D1["read that file"] --> F
 ```
 
-| Module | What it does |
-|---|---|
-| `karna/storage/memtable.py` | sorted in-memory buffer with tombstones and a size-based flush threshold |
-| `karna/storage/sstable.py` | immutable sorted files: data block, sparse index, Bloom filter, footer + magic |
-| `karna/storage/lsm_engine.py` | put/get/delete, WAL replay, flush, L0→L1 compaction |
-| `karna/indexes/learned_bloom.py` | learned Bloom filter (MLP + calibrated threshold + backup filter) |
-| `karna/benchmarks/benchmark.py` | throughput, latency and filter FPR/memory benchmarks |
+**Why it's built this way:** writes only ever *append*, which is the fastest thing a disk can do, so the engine absorbs about **67,000 writes per second** in pure Python. The price is that a key could be in many files, so reads must skip as many files as possible. That's the Bloom filter's job.
 
-## The learned Bloom filter
+## The idea: a Bloom filter that learned
 
-A classic Bloom filter needs about `-n·ln(ε)/(ln 2)²` bits regardless of what the keys look like. A learned filter trains a classifier to tell stored keys from the keys you'll actually query. It then sets the decision threshold on **held-out** negative keys so the model admits a target fraction ε_model of absent keys. Every stored key the model rejects goes into a small backup filter, so there are **never false negatives**:
+A **Bloom filter** is a tiny structure that answers "is this key *definitely not* in this file?". It's how reads avoid opening files for nothing. It's very good, but it treats keys as random noise, so its size depends only on *how many* keys you have.
 
-    FPR ≈ ε_model + (1 − ε_model) · ε_backup
+Real keys aren't random. `user:000…`, `order:000…` and `session:000…` look different. So Karna trains a small neural network to separate "keys we store" from "keys people ask for that we don't have":
 
-Keys are featurised from their characters and shape (leading bytes, length, digit/alpha/punctuation ratios), not from a hash. Hashing first would turn every key into uniform noise and leave the model nothing to learn.
+```mermaid
+flowchart TD
+    Q["is key X stored?"] --> N{"Neural network score<br/>above calibrated threshold?"}
+    N -- "yes" --> Y["maybe present"]
+    N -- "no" --> B{"Small backup<br/>Bloom filter"}
+    B -- "yes" --> Y
+    B -- "no" --> NO["definitely absent"]
+```
+
+- Keys the model confidently recognises skip the classic filter completely.
+- Any stored key the model *misses* goes into the small backup filter, so there are **never false negatives** (a stored key is never reported missing). This is tested.
+- The threshold is calibrated on **held-out** absent keys so the false-positive rate is a *target you set*, not a hope.
 
 ### Measured results
 
-20,000 stored keys (`user:<10 digits>`), 10,000 absent test keys, both filters targeting about 1% FPR (`python3 karna/benchmarks/benchmark.py`):
+20,000 stored keys, 10,000 absent test keys, both filters aimed at about 1% false positives (`python3 karna/benchmarks/benchmark.py`):
 
-| Absent keys look like… | Classic filter | Learned filter |
+| Absent keys look... | Classic Bloom filter | Learned Bloom filter |
 |---|---|---|
-| other key families (`order:`, `sess:`, `cart:`) | 0.97% FPR, 23,963 B | **0.48% FPR, 2,452 B** (10× smaller) |
-| stored keys (`user:`, same shape) | 0.88% FPR, 23,963 B | 1.01% FPR, 29,868 B (25% larger) |
+| **different** from stored keys (`order:`, `sess:`, `cart:`) | 0.97% false positives, 23,963 bytes | **0.48% false positives, 2,452 bytes** |
+| **identical** to stored keys (`user:` with the same shape) | 0.88% false positives, 23,963 bytes | 1.01% false positives, 29,868 bytes |
 
-The trade-off is visible in both rows. When absent keys have learnable structure, the model does most of the filtering and the backup filter is nearly empty. When they don't, calibration correctly refuses to trust the model: almost every key lands in the backup filter, the FPR guarantee still holds, and you pay for the model on top. Queries are also slower in this Python implementation (about 150–240 µs vs 6–8 µs), because each lookup runs an MLP forward pass.
+The trade-off is real. In this Python implementation a learned lookup takes about 150–240 µs against 6–8 µs for a classic one, because it runs a neural-network forward pass. So the learned filter pays off when memory is the constraint and the data has structure.
 
-Engine throughput on the same machine (single process, CPython): about 67k writes/s (p99 0.12 ms) and about 2.5M MemTable-hit reads/s.
+## What's in the box
 
-## Bugs fixed while validating
+| Component | What it does |
+|---|---|
+| [`memtable.py`](karna/storage/memtable.py) | sorted in-memory write buffer with deletion markers (tombstones) |
+| [`sstable.py`](karna/storage/sstable.py) | immutable sorted files with a sparse index, a footer and a per-file Bloom filter sized to the file's key count |
+| [`lsm_engine.py`](karna/storage/lsm_engine.py) | `put` / `get` / `delete`, write-ahead-log replay, flushing, compaction |
+| [`learned_bloom.py`](karna/indexes/learned_bloom.py) | the learned filter: structural key features, small neural network, threshold calibration, backup filter |
+| [`benchmark.py`](karna/benchmarks/benchmark.py) | throughput, latency and filter benchmarks that produce the numbers above |
 
-- **SSTable Bloom filters were a fixed 1,024 bits.** Any table with more than a few hundred keys saturated its filter, so every lookup read every table. Filters are now sized from each table's key count at the target FPR.
-- **Hash positions repeated for k > 3.** Bit positions came from fixed 8-byte digest slices that cycled after three. They now use Kirsch–Mitzenmacher double hashing.
-- **The learned filter had a 48% FPR.** It featurised SHA-256 digests and used a fixed 0.5 threshold. It now uses structural features and threshold calibration, as described above.
+## Engineering notes
 
-## Running
+Bugs found and fixed while validating the engine, because they're the interesting part:
+
+- **Per-file Bloom filters were a fixed 1,024 bits.** Any file with more than a few hundred keys filled the filter up, so every lookup opened every file. Filters are now sized from each file's real key count.
+- **Hash positions repeated once the filter used more than three hashes.** They now use double hashing (Kirsch–Mitzenmacher), which gives independent-looking positions for any count.
+- **The first learned filter had a 48% false-positive rate.** It fed *hashed* keys to the model, which destroys all structure, and used a fixed 0.5 threshold. It now uses structural features (leading characters, length, digit and letter ratios) and a calibrated threshold.
+- **A newest-wins test across repeated compactions** and a **tombstone-shadowing test** guard against the classic LSM bug where a deleted key reappears from an older file.
+
+## Run it
 
 ```bash
 pip install -r requirements.txt
-pytest -q                                  # 13 tests
-python3 karna/benchmarks/benchmark.py      # numbers above
-python3 karna/storage/lsm_engine.py        # per-module sanity checks also run standalone
+pytest -q                               # 13 tests: reads across compactions, deletes, crash recovery, filters
+python3 karna/benchmarks/benchmark.py   # reproduces every number in this README
 ```
 
-The tests cover reads across flushes and repeated compactions (newest version wins across L1 tables), tombstones shadowing values in lower levels, WAL crash recovery, clean restarts, SSTable round-trips, Bloom filter FPR, and the learned filter's no-false-negative guarantee on both key distributions.
+```python
+from karna.storage.lsm_engine import LSMEngine
 
-## Status and next steps
+db = LSMEngine("./data")
+db.put("user:42", b"Ada")
+db.get("user:42")     # b"Ada"
+db.delete("user:42")
+db.get("user:42")     # None
+db.close()
+```
 
-- `karna-rust/` is an **uncompiled skeleton** of a Rust port (storage crate drafted, server/client/consensus crates empty). It is not part of the working system.
-- Compaction is a single L0→L1 merge. Leveled compaction with per-level size targets, and dropping tombstones at the bottom level, are the next storage steps.
-- Nothing is distributed yet. Replication (Raft) would sit above `LSMEngine`.
+## Limits and next steps
+
+- Compaction is a single Level 0 → Level 1 merge. Leveled compaction with per-level size targets, and dropping deletion markers at the bottom level, are the next steps.
+- It's a single-node engine. Replication (Raft) would sit on top of it.
+- Throughput is CPython-bound. A Rust port is the planned way to close that gap, but it isn't part of this repository yet.
+
+## References
+
+- Kraska et al., *The Case for Learned Index Structures*, SIGMOD 2018
+- Mitzenmacher, *A Model for Learned Bloom Filters*, NeurIPS 2018
+- O'Neil et al., *The Log-Structured Merge-Tree (LSM-Tree)*, Acta Informatica 1996
+
+MIT License, see [LICENSE](LICENSE).
